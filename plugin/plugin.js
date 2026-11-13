@@ -228,6 +228,10 @@ export function parseBlocks(text){
   while(i<lines.length){
     const line=lines[i];
     if(!line.trim()){i++;continue;}
+    const fence=line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+    if(fence){const raw=[line],body=[];i++;let closed=false;
+      while(i<lines.length){const next=lines[i++];raw.push(next);const end=next.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);if(end&&end[1][0]===fence[1][0]&&end[1].length>=fence[1].length){closed=true;break;}body.push(next);}
+      blocks.push({type:closed?'code':'p',text:closed?body.join('\n'):raw.join('\n')});continue;}
     const callout=line.match(CALLOUT);
     if(callout){
       const body=callout[2]?[callout[2]]:[];i++;
@@ -387,6 +391,36 @@ export function requestFull(connection,message){
   return connection.session.messages.reply(message.channelId,message.threadRootId,FULL_REQUEST,[message.authorId],[],message.id);
 }
 
+// Exact server result-page envelope; ordinary chat and incomplete pages stay native.
+export function parseFullResult(message){
+  const text=message?.content;
+  if(typeof text!=='string'||text.length>6000||text.includes('[webling-'))return null;
+  const lines=text.replace(/\r\n?/g,'\n').split('\n');
+  const title=lines[0].match(/^전체 결과 · (.+)$/)?.[1];
+  const meta=lines[1]?.match(/^([1-9][0-9]{0,2})\/([1-9][0-9]{0,2})쪽 · (검토된 본문|제출된 본문 · 독립 검토 미완료)$/);
+  if(!title||!meta||lines.length<5||lines[2]!==''||lines.at(-2)!=='')return null;
+  const page=Number(meta[1]),total=Number(meta[2]);
+  if(page>total||total>200)return null;
+  const footer=page<total?`이어서 보려면 “전체 결과 ${page+1}쪽 보여줘” 또는 “다음 결과 보여줘”라고 답해 주세요.`:'결과를 모두 표시했습니다. 수정할 내용은 이 대화에 알려 주세요.';
+  if(lines.at(-1)!==footer)return null;
+  const body=lines.slice(3,-2).join('\n');if(!body.trim())return null;
+  const sections=[];let current={title:'본문',lines:[]},fence=null;
+  for(const line of body.split('\n')){
+    const marker=line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+    if(marker){if(!fence)fence=marker[1];else if(marker[1][0]===fence[0]&&marker[1].length>=fence.length&&!marker[2].trim())fence=null;current.lines.push(line);continue;}
+    const heading=!fence&&(line.match(/^#{1,6} (.+)$/)||line.match(/^\*\*([^*]+)\*\*$/)||line.match(/^\d+\. ([^\n.!?。]{1,60})$/));
+    if(heading){if(current.lines.length||current.title!=='본문')sections.push(current);current={title:heading[1],lines:[]};}
+    else current.lines.push(line);
+  }
+  if(fence)return null;
+  if(current.lines.length||current.title!=='본문')sections.push(current);
+  return {title,page,total,reviewed:meta[3]==='검토된 본문',sections:sections.map(x=>({...x,blocks:parseBlocks(x.lines.join('\n'))})),footer};
+}
+export function requestResultPage(connection,message,page){
+  if(!Number.isInteger(page)||page<1||page>200||connection?.status!=='ready'||!canAskFull(message))throw Error('원래 업무 스레드에서 요청해 주세요.');
+  return connection.session.messages.reply(message.channelId,message.threadRootId,`전체 결과 ${page}쪽 보여줘`,[message.authorId],[],message.id);
+}
+
 // Agent replies opt in by using a callout; plain chat keeps the host renderer.
 export function parseRichMessage(message){
   const text=message?.content;
@@ -419,6 +453,7 @@ function registerReportCards(ctx) {
   function blocks(list){
     return groupDetails(list).map((b,i)=>{
       if(b.type==='details')return disclosure(b.title,blocks(b.blocks),i,detailNeedsAttention(b.blocks));
+      if(b.type==='code')return h('pre',{key:i,style:{fontSize:12,lineHeight:1.6,whiteSpace:'pre-wrap',overflowWrap:'anywhere',background:'#f6f7f9',padding:12,borderRadius:8}},b.text);
       if(b.type==='p')return h('div',{key:i},...b.text.split('\n').map((text,j)=>h('p',{key:j,style:{margin:'8px 0',whiteSpace:'pre-wrap'}},...inline(text))));
       if(b.type==='heading')return h('h4',{key:i,style:{fontSize:12,color:muted,fontWeight:650,margin:'14px 0 4px'}},b.text);
       if(b.type==='callout')return callout(b.label,b.tone,b.text,i);
@@ -447,6 +482,30 @@ function registerReportCards(ctx) {
       h('button',{type:'button',onClick:ask,disabled:!ready,style:{appearance:'none',font:'inherit',fontSize:13,fontWeight:600,minHeight:44,padding:'8px 14px',borderRadius:10,border:'1px solid #cfd6df',background:'#ffffff',color:ready?ink:'#6b7280',cursor:ready?'pointer':'default'}},state==='sent'?'요청을 보냈어요':'전체 결과 요청'),
       state==='error'?h('span',{role:'alert',style:{fontSize:12,color:TONES.danger.fg}},'보내지 못했어요. “전체 결과 보여줘”라고 답해 주세요.'):
       !ready&&state!=='sent'&&h('span',{style:{fontSize:12,color:muted}},'“전체 결과 보여줘”라고 답해도 돼요.'));
+  }
+  function ResultNavigation({message,page}){
+    const connection=ctx.relay?.snapshot?R.useSyncExternalStore(ctx.relay.subscribe,ctx.relay.snapshot):null;
+    const [state,setState]=R.useState(''),busy=R.useRef(false);
+    const ready=connection?.status==='ready'&&canAskFull(message)&&!state.startsWith('sent')&&state!=='busy';
+    async function ask(){if(!ready||busy.current)return;busy.current=true;setState('busy');try{await requestResultPage(connection,message,page);setState('sent');}catch{setState('error');busy.current=false;}}
+    return h('div',{style:{marginTop:14}},h('button',{type:'button',onClick:ask,disabled:!ready,style:{font:'inherit',fontSize:14,fontWeight:600,minHeight:44,padding:'10px 16px',borderRadius:10,border:'1px solid #cfd6df',background:'#fff',color:ink,cursor:ready?'pointer':'default'}},state==='sent'?'다음 쪽 요청을 보냈어요':state==='busy'?'요청 중…':`다음 ${page}쪽 보기`),
+      h('p',{role:state==='error'?'alert':undefined,style:{fontSize:12,color:muted,margin:'8px 0 0'}},state==='error'?'전송하지 못했어요. 다시 누르거나 아래 문장으로 답해 주세요.':state==='sent'?'전송 요청 상태입니다. 같은 대화에 도착하는 답변을 확인해 주세요.':`“전체 결과 ${page}쪽 보여줘”라고 답해도 돼요.`));
+  }
+  function FullResultCard({message}){
+    const report=parseFullResult(message);
+    const important=title=>/결론|요약|남은|다음|미확인|미검증|주의|위험|사용자.*조치/.test(title);
+    return h('section',{'aria-label':'전체 작업 결과',className:'webling-full-result',style:cardStyle('#dfe4ea')},
+      h('header',{style:{padding:'16px 18px',borderBottom:'1px solid '+line}},
+        h('div',{style:{display:'flex',gap:8,flexWrap:'wrap'}},chip('전체 결과','info'),chip(`${report.page} / ${report.total}쪽`,'muted')),
+        h('h3',{style:{fontSize:17,lineHeight:1.5,margin:'10px 0 8px'}},report.title),
+        h('p',{style:{margin:0,fontSize:13,color:muted}},report.reviewed?'검토된 본문 · 업무의 최종 완료 여부는 별도입니다.':'제출된 내용입니다. 별도 검토는 아직 끝나지 않았어요.')),
+      h('div',{style:{padding:'2px 18px 16px'}},
+        ...report.sections.map((section,i)=>{
+          const content=blocks(section.blocks);
+          if(i===0||important(section.title))return h('section',{key:i,style:{margin:'16px 0'}},h('h4',{style:{fontSize:14,margin:'0 0 8px',color:ink}},section.title),...content);
+          return disclosure(section.title+(detailNeedsAttention(section.blocks)?' · 미확인·주의 내용 포함':''),content,i);
+        }),
+        report.page<report.total?h(ResultNavigation,{message,page:report.page+1}):h('p',{style:{margin:'16px 0 0',fontSize:13,color:muted}},'마지막 쪽입니다. 수정할 내용은 이 대화에 알려 주세요.')));
   }
   function ReportCard({message}) {
     const report=parseReportCard(message),parts=reportSections(report);
@@ -538,6 +597,7 @@ function registerReportCards(ctx) {
     h('div',{className:'webling-start-note',style:{display:'inline-flex',alignItems:'center',gap:8,padding:'6px 12px',border:'1px solid '+line,borderRadius:999,background:'#fafbfc',color:'#374151',fontSize:13}},
       h('span',{'aria-hidden':true,style:{width:8,height:8,borderRadius:'50%',background:TONES.info.fg}}),chip('진행','info'),'작업을 시작했습니다.')});
   ctx.conversation.registerMessage({id:'work-progress',title:'Buzz 대화 카드 진행 기록',matches:message=>!!parseProgress(message),component:ProgressCard});
+  ctx.conversation.registerMessage({id:'work-full-result',title:'Buzz 전체 결과',matches:message=>!!parseFullResult(message),component:FullResultCard});
   ctx.conversation.registerMessage({id:'work-report',title:'Buzz 대화 카드 진행·결과',matches:message=>!!parseReportCard(message),component:ReportCard});
   ctx.conversation.registerMessage({id:'agent-rich',title:'위블링 에이전트 답변',matches:message=>!!parseRichMessage(message),component:RichMessage});
 }
