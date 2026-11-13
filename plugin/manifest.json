@@ -1,0 +1,9 @@
+{
+  "id": "webling.work",
+  "name": "Buzz 대화 카드",
+  "apiVersion": 1,
+  "description": "Buzz 대화에서 에이전트 질문에 선택·입력으로 답하고, 진행 상황과 결과를 카드로 확인합니다.",
+  "updates": {
+    "defaultEnabled": true
+  }
+}
