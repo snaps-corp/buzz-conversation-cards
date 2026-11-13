@@ -195,14 +195,17 @@ const STATUS_TONES={'확인':'done','완료':'done','통과':'done','가설':'gu
 export function statusTone(word){return STATUS_TONES[String(word).trim()]||null;}
 
 // A small Markdown subset. Everything else stays literal text; message HTML never runs.
+function managementLink(value){
+  try{const u=new URL(value);return u.hostname==='buzz.webling.kr'&&/^\/(admin|work)(\/|$)/.test(u.pathname);}catch{return false;}
+}
 export function inlineTokens(text){
   return String(text).split(/(\*\*[^*\n]+\*\*|==[^=\n]+==|`[^`\n]+`|\[[^\]\n]+\]\(https:\/\/[^\s()]+\)|https:\/\/[^\s<>]+)/g).filter(Boolean).map(part=>{
     if(/^\*\*[^*\n]+\*\*$/.test(part))return {type:'bold',text:part.slice(2,-2)};
     if(/^==[^=\n]+==$/.test(part))return {type:'mark',text:part.slice(2,-2)};
     if(/^`[^`\n]+`$/.test(part))return {type:'code',text:part.slice(1,-1)};
     const link=part.match(/^\[([^\]\n]+)\]\((https:\/\/[^\s()]+)\)$/);
-    if(link)return {type:'link',text:link[1],href:link[2]};
-    if(/^https:\/\/[^\s<>]+$/.test(part))return {type:'link',text:part,href:part};
+    if(link)return managementLink(link[2])?{type:'text',text:link[1]+' (대화에서 전체 결과를 요청해 주세요)'}:{type:'link',text:link[1],href:link[2]};
+    if(/^https:\/\/[^\s<>]+$/.test(part))return managementLink(part)?{type:'text',text:'관리 화면 링크 대신 대화에서 전체 결과를 요청해 주세요.'}:{type:'link',text:part,href:part};
     return {type:'text',text:part};
   });
 }
@@ -321,7 +324,6 @@ export function parseReportCard(message) {
   }
   return {label,title,lines};
 }
-const STEP_NAMES=['접수','작업','검토','확인 요청'];
 const STEP_AT={'요청을 받았습니다':1,'작성 중입니다':1,'분석 중입니다':1,'자료를 준비하고 있습니다':1,'진행 상황을 알려드립니다':1,'수정 요청을 반영합니다':1,
   '결과를 확인하고 있습니다':2,'검토를 마무리하고 있습니다':2,'결과 제출 · 검토 미배정':2,'확인해 주세요':3,'보류 중입니다':3,'확정했습니다':4,'정책에 따라 완료했습니다':4};
 export function reportStep(label){return label in STEP_AT?STEP_AT[label]:null;}
@@ -352,6 +354,11 @@ export function reportSections(report){
 // Only explicitly labelled developer detail is collapsed. Never infer success,
 // shorten evidence, or hide warnings/questions based on technical-looking words.
 const DETAIL_TITLES=new Set(['개발 상세','기술 상세','검사 상세']);
+// Uncertain/failing detail stays expanded. This only affects presentation;
+// it never removes text or decides that a task is complete.
+export function detailNeedsAttention(blocks){
+  return /미완료|미확인|미검증|실패|차단|못했|못한|않았|아직|위험|주의|금지|error|failed|blocked|timeout/i.test(JSON.stringify(blocks));
+}
 export function groupDetails(list){
   const result=[];
   for(let i=0;i<list.length;i++){
@@ -410,8 +417,8 @@ function registerReportCards(ctx) {
   }
   function blocks(list){
     return groupDetails(list).map((b,i)=>{
-      if(b.type==='details')return disclosure(b.title,blocks(b.blocks),i);
-      if(b.type==='p')return h('p',{key:i,style:{margin:'6px 0',whiteSpace:'pre-wrap'}},...inline(b.text));
+      if(b.type==='details')return disclosure(b.title,blocks(b.blocks),i,detailNeedsAttention(b.blocks));
+      if(b.type==='p')return h('div',{key:i},...b.text.split('\n').map((text,j)=>h('p',{key:j,style:{margin:'8px 0',whiteSpace:'pre-wrap'}},...inline(text))));
       if(b.type==='heading')return h('h4',{key:i,style:{fontSize:12,color:muted,fontWeight:650,margin:'14px 0 4px'}},b.text);
       if(b.type==='callout')return callout(b.label,b.tone,b.text,i);
       if(b.type==='ul')return h('ul',{key:i,style:{listStyle:b.items.every(x=>x.status)?'none':'disc',margin:'6px 0',paddingLeft:b.items.every(x=>x.status)?0:20}},...b.items.map((x,j)=>x.status?itemLine(x,j):h('li',{key:j,style:{margin:'3px 0'}},...inline(x.text))));
@@ -424,8 +431,8 @@ function registerReportCards(ctx) {
       return null;
     });
   }
-  function disclosure(title,content,key){
-    return h('details',{key,className:'webling-technical-details',style:{margin:'12px 0 4px',borderTop:'1px solid '+line,paddingTop:6}},
+  function disclosure(title,content,key,open=false){
+    return h('details',{key,open,className:'webling-technical-details',style:{margin:'12px 0 4px',borderTop:'1px solid '+line,paddingTop:6}},
       h('summary',{style:{cursor:'pointer',padding:'8px 0',fontSize:13,color:muted,fontWeight:600}},title+' 보기'),
       h('div',{style:{padding:'2px 0 8px',fontSize:13}},...content));
   }
@@ -436,41 +443,48 @@ function registerReportCards(ctx) {
     function ask(){if(busy.current||!ready)return;busy.current=true;
       try{requestFull(connection,message);setState('sent');}catch(err){busy.current=false;setState('error');}}
     return h('div',{style:{display:'flex',alignItems:'center',flexWrap:'wrap',gap:10,padding:'4px 18px 18px'}},
-      h('button',{type:'button',onClick:ask,disabled:!ready,style:{appearance:'none',font:'inherit',fontSize:13,fontWeight:600,minHeight:40,padding:'8px 14px',borderRadius:10,border:'1px solid #cfd6df',background:'#ffffff',color:ready?ink:'#6b7280',cursor:ready?'pointer':'default'}},state==='sent'?'요청을 보냈어요':'전체 결과 보기'),
+      h('button',{type:'button',onClick:ask,disabled:!ready,style:{appearance:'none',font:'inherit',fontSize:13,fontWeight:600,minHeight:44,padding:'8px 14px',borderRadius:10,border:'1px solid #cfd6df',background:'#ffffff',color:ready?ink:'#6b7280',cursor:ready?'pointer':'default'}},state==='sent'?'요청을 보냈어요':'전체 결과 요청'),
       state==='error'?h('span',{role:'alert',style:{fontSize:12,color:TONES.danger.fg}},'보내지 못했어요. “전체 결과 보여줘”라고 답해 주세요.'):
       !ready&&state!=='sent'&&h('span',{style:{fontSize:12,color:muted}},'“전체 결과 보여줘”라고 답해도 돼요.'));
   }
   function ReportCard({message}) {
     const report=parseReportCard(message),parts=reportSections(report);
     const stopped=['진행이 멈췄습니다','상태 확인이 필요합니다','업무를 취소했습니다'].includes(report.label);
-    const step=reportStep(report.label),tone=stopped?'warn':step===4||report.label==='확인해 주세요'?'done':'info',t=TONES[tone];
+    const tone=stopped?'warn':reportStep(report.label)===4?'done':'info',t=TONES[tone];
     const named=key=>parts.rows.find(r=>r.key===key)?.value;
     const action=['누가','무엇을','그다음'].filter(named);
     const next=parts.sections.find(s=>s.title==='다음');
-    const body=parts.sections.filter(s=>s!==next);
-    return h('section',{'aria-label':'업무 진행과 결과',className:'webling-report-card',style:cardStyle(stopped?'#f0dfc2':'#dfe4ea')},
-      h('div',{style:{padding:'16px 18px 14px',background:stopped?'#fffaf1':tone==='done'?'#f5fbf7':'#f6f9ff',borderBottom:'1px solid '+(stopped?'#f3e6cf':'#e6edf8')}},
-        h('span',{style:{display:'inline-block',padding:'4px 10px',borderRadius:999,background:t.fg,color:'#ffffff',fontSize:12,fontWeight:650}},report.label==='진행이 멈췄습니다'?'멈춤 · 사람 확인 필요':displayStatus(report.label)),
-        h('h3',{style:{margin:'10px 0 0',fontSize:17,lineHeight:1.45,fontWeight:700,color:'#16202c'}},report.title)),
-      step!==null&&h('ol',{'aria-label':'진행 단계',style:{display:'grid',gridTemplateColumns:'repeat(4,minmax(0,1fr))',gap:6,listStyle:'none',margin:0,padding:'14px 18px 4px'}},
-        ...STEP_NAMES.map((name,i)=>{const done=i<step,now=i===step;
-          return h('li',{key:i,'aria-current':now?'step':undefined,style:{display:'flex',flexDirection:'column',gap:6,fontSize:12,color:done?TONES.done.fg:now?TONES.info.fg:'#6b7280',fontWeight:now?650:400}},
-            h('span',{'aria-hidden':true,style:{height:4,borderRadius:2,background:done?'#2f8a5f':now?TONES.info.fg:'#e5e7eb'}}),name);})),
-      h('div',{style:{padding:'6px 18px 8px'}},
-        ...body.map((s,i)=>DETAIL_TITLES.has(s.title)?h('div',{key:i},...blocks([{type:'heading',text:s.title},...s.blocks])):h('div',{key:i},s.title&&h('h4',{style:{fontSize:12,color:muted,fontWeight:650,margin:'12px 0 2px'}},s.title),...blocks(s.blocks))),
-        parts.partial&&h('p',{style:{fontSize:12,color:muted,margin:'4px 0'}},'본문 일부를 표시했어요.'),
-        ...parts.rows.filter(r=>!['막힌 이유','누가','무엇을','그다음'].includes(r.key)).map((r,i)=>h('div',{key:'row'+i,style:{display:'grid',gridTemplateColumns:'64px minmax(0,1fr)',gap:12,padding:'7px 0',fontSize:13,borderBottom:'1px solid #f0f2f5'}},
-          h('span',{style:{color:'#6b7280'}},r.key),
-          h('span',null,r.key==='검증'?chip(displayStatus(r.value),verificationTone(r.value)):inline(r.value)))),
-        named('막힌 이유')&&callout('막힌 이유','warn',named('막힌 이유')),
-        action.length>0&&h('div',{style:{border:'1px solid #cfdcf3',borderRadius:12,overflow:'hidden',margin:'10px 0'}},
-          h('div',{style:{padding:'8px 14px',background:TONES.info.bg,color:TONES.info.fg,fontSize:12,fontWeight:700}},'필요한 조치'),
-          ...action.map(key=>h('div',{key,style:{display:'grid',gridTemplateColumns:'52px minmax(0,1fr)',gap:10,padding:'8px 14px',fontSize:13,borderTop:'1px solid #eef2f8'}},h('span',{style:{color:'#6b7280'}},key),h('span',null,...inline(named(key)))))),
-        next&&h('div',{style:{margin:'10px 0 8px',padding:'10px 14px',borderRadius:10,background:'#f6f7f9',fontSize:13,color:'#374151'}},
-          h('strong',{style:{display:'block',fontSize:12,color:muted,marginBottom:2}},'다음'),...blocks(next.blocks)),
-        report.original&&h('details',{style:{marginTop:10,borderTop:'1px solid #edf0f4',paddingTop:8,fontSize:12,color:muted}},h('summary',{style:{cursor:'pointer',padding:'6px 0'}},'기존 안내 원문'),h('p',{style:{whiteSpace:'pre-wrap'}},report.original))),
+    const body=parts.sections.filter(s=>s!==next&&!DETAIL_TITLES.has(s.title));
+    const technical=parts.sections.filter(s=>DETAIL_TITLES.has(s.title));
+    const attention=b=>b.type==='callout'&&['주의','위험','요청','금지','미확인'].includes(b.label);
+    const detailAlerts=technical.flatMap(s=>s.blocks.filter(attention));
+    // Long historical reports keep every word, but put actionable state first.
+    const longBody=body.reduce((n,s)=>n+s.blocks.reduce((m,b)=>m+(b.text||JSON.stringify(b)).length,0),0)>800;
+    const renderBody=()=>body.map((s,i)=>h('div',{key:i},s.title&&h('h4',{style:titleStyle},s.title==='무엇이 바뀌었나요'?'작업 요약':s.title),...blocks(s.blocks)));
+    const titleStyle={fontSize:13,color:muted,fontWeight:650,margin:'16px 0 6px'};
+    return h('section',{'aria-label':'업무 진행과 결과',className:'webling-report-card',style:cardStyle('#dfe4ea')},
+      h('header',{style:{padding:'16px 18px 0'}},
+        chip(report.label==='진행이 멈췄습니다'?'진행 중단':displayStatus(report.label),tone),
+        h('h3',{style:{margin:'10px 0 0',fontSize:17,lineHeight:1.5,fontWeight:700,color:'#16202c'}},report.title)),
+      h('div',{style:{padding:'0 18px 12px'}},
+        ...(!longBody?renderBody():[]),
+        parts.partial&&h('p',{style:{fontSize:13,color:muted,margin:'8px 0'}},'본문 일부입니다. 전체 결과를 요청할 수 있어요.'),
+        ...blocks(detailAlerts),
+        named('막힌 이유')&&callout('진행이 막힌 이유','warn',named('막힌 이유')),
+        ...parts.rows.filter(r=>r.key==='검증').map((r,i)=>h('div',{key:'verification'+i,style:{margin:'12px 0',padding:'8px 0',borderTop:'1px solid '+line,fontSize:14}},
+          h('span',{style:{fontWeight:600,marginRight:8}},'확인 상태'),h('span',{style:{color:TONES[verificationTone(r.value)].fg}},displayStatus(r.value)))),
+        (next||action.length>0)&&h('section',{className:'webling-next-action','aria-label':'다음 진행',style:{margin:'14px 0',padding:'2px 0 2px 12px',borderLeft:'3px solid '+t.fg}},
+          h('h4',{style:{fontSize:14,fontWeight:650,margin:'0 0 6px',color:ink}},'다음 진행'),
+          ...action.map(key=>h('div',{key,style:{margin:'6px 0',fontSize:14}},h('strong',{style:{marginRight:8}},key==='누가'?'담당':key==='무엇을'?'할 일':'이후'),...inline(named(key)))),
+          next&&h('div',null,...blocks(next.blocks))),
+        ...parts.rows.filter(r=>!['검증','막힌 이유','누가','무엇을','그다음'].includes(r.key)).map((r,i)=>h('div',{key:'row'+i,style:{display:'grid',gridTemplateColumns:'60px minmax(0,1fr)',gap:10,padding:'8px 0',fontSize:14,borderTop:'1px solid '+line}},
+          h('span',{style:{color:muted}},r.key),h('span',null,...inline(r.value)))),
+        ...(longBody?renderBody():[]),
+        ...technical.map((s,i)=>h('div',{key:'technical'+i},...blocks([{type:'heading',text:s.title},...s.blocks.filter(b=>!attention(b))]))),
+        report.original&&h('details',{open:true,style:{marginTop:10,borderTop:'1px solid '+line,paddingTop:8,fontSize:13,color:muted}},h('summary',{style:{cursor:'pointer',padding:'8px 0'}},'기존 안내 원문'),h('p',{style:{whiteSpace:'pre-wrap'}},report.original))),
       parts.full&&h(FullResult,{message}));
   }
+
   function HandoffRow({message,p}) {
     const [fresh]=R.useState(()=>handoffFresh(message));
     R.useEffect(()=>{if(message.id)PLAYED.add(message.id);},[message.id]);
