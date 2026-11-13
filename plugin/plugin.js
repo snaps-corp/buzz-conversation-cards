@@ -6,6 +6,7 @@ export function apply(ctx) {
     throw new Error('Buzz conversation API가 필요합니다.');
   if (ctx.relay?.snapshot && ctx.relay?.subscribe) registerQuestions(ctx);
   registerResourceCards(ctx);
+  registerPreviewCards(ctx);
   registerReportCards(ctx);
 }
 
@@ -539,4 +540,47 @@ function registerReportCards(ctx) {
   ctx.conversation.registerMessage({id:'work-progress',title:'Buzz 대화 카드 진행 기록',matches:message=>!!parseProgress(message),component:ProgressCard});
   ctx.conversation.registerMessage({id:'work-report',title:'Buzz 대화 카드 진행·결과',matches:message=>!!parseReportCard(message),component:ReportCard});
   ctx.conversation.registerMessage({id:'agent-rich',title:'위블링 에이전트 답변',matches:message=>!!parseRichMessage(message),component:RichMessage});
+}
+
+
+// Narrow legacy preview notice contract. Unknown formats keep the host renderer.
+export function parsePreviewCard(message){
+  const content=message?.content;
+  if(typeof content!=='string'||content.length>4000||content.includes('[webling-'))return null;
+  const lines=content.replace(/\r\n?/g,'\n').split('\n');
+  const state=lines.findIndex(line=>/^현재 ready · 만료 .+/.test(line));
+  if(state<2)return null;
+  const links=[];
+  for(const line of lines.slice(1,state)){
+    if(!line.trim())continue;
+    const m=line.match(/^\[([^\]\n]{1,100})\]\((https:\/\/[^\s()]+)\)$/);
+    if(!m)return null;
+    let url;try{url=new URL(m[2]);}catch{return null;}
+    if(url.username||url.password||url.port||!(
+      /^task-[a-f0-9]{32}\.preview\.buzz\.webling\.kr$/.test(url.hostname)||
+      /^pr-\d+\.[a-z0-9]+\.amplifyapp\.com$/.test(url.hostname)))return null;
+    links.push({label:m[1],url:m[2]});
+  }
+  if(!lines[0].trim()||!links.length||links.length>6)return null;
+  const expiry=lines[state].replace(/^현재 ready · 만료 /,'');
+  const notes=lines.slice(state+1).join('\n').trim();
+  if(!notes)return null; // Keep the verification statement; never invent it.
+  return {title:lines[0],links,expiry,notes};
+}
+function registerPreviewCards(ctx){
+  const h=ctx.react.createElement;
+  ctx.conversation.registerMessage({id:'work-preview-links',title:'상품별 미리보기',matches:m=>!!parsePreviewCard(m),component:({message})=>{
+    const p=parsePreviewCard(message);
+    return h('section',{className:'webling-preview-card','aria-label':'상품별 미리보기',style:{boxSizing:'border-box',width:'100%',maxWidth:560,padding:16,border:'1px solid #dfe4ea',borderRadius:16,background:'#fff',color:'#203247',colorScheme:'light',font:'inherit',fontSize:14,lineHeight:1.65,overflowWrap:'anywhere'}},
+      h('span',{style:{fontSize:12,color:'#174ea6',fontWeight:650}},'미리보기 준비됨 · 안내 시점 기준'),
+      h('h3',{style:{margin:'8px 0 14px',fontSize:16,lineHeight:1.5}},'상품별 미리보기'),
+      h('p',{style:{fontSize:13,color:'#526174',margin:'-8px 0 12px'}},p.title),
+      h('div',{style:{display:'flex',flexDirection:'column',gap:8}},...p.links.map((link,i)=>h('a',{key:i,href:link.url,target:'_blank',rel:'noopener noreferrer',style:{boxSizing:'border-box',display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,minHeight:46,padding:'10px 12px',border:'1px solid #c3d4ed',borderRadius:10,color:'#174ea6',background:'#f5f8ff',fontWeight:650,textDecoration:'none'}},
+        h('span',null,link.label+' 열기'),h('span',{'aria-hidden':true},'↗')))),
+      h('div',{style:{marginTop:14,fontSize:13,color:'#526174'}},h('strong',null,'안내된 만료 시각'),h('div',null,p.expiry)),
+      h('div',{style:{marginTop:14,padding:'10px 12px',borderRadius:10,background:'#fff6e7',color:'#5c3b0e'}},
+        h('strong',{style:{display:'block',fontSize:13,marginBottom:4}},'확인 범위'),
+        h('div',{style:{whiteSpace:'pre-wrap'}},p.notes)),
+      h('p',{style:{margin:'10px 0 0',fontSize:12,color:'#526174'}},'이 카드는 메시지에 안내된 상태입니다. 현재 접속 가능 여부를 실시간 확인하지 않습니다.'));
+  }});
 }
