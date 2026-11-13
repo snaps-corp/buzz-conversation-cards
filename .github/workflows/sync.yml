@@ -1,0 +1,27 @@
+name: Publish deployed plugin
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: plugin-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: python3 -m unittest discover -s tools -p 'test_*.py'
+      - run: python3 tools/sync.py
+      - name: Publish only reviewed plugin files
+        shell: bash
+        run: |
+          git add -- plugin/manifest.json plugin/plugin.js plugin/VERSION
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'Buzz plugin publisher'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Publish deployed plugin $(cat plugin/VERSION)"
+          git push origin HEAD:main
